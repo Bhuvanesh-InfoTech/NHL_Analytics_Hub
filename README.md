@@ -39,36 +39,8 @@ results through a multi-page Streamlit dashboard.
 
 Full column definitions and constraints are in [`sql/create_tables.sql`](sql/create_tables.sql).
 
-## Setup Instructions
 
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/Bhuvanesh-InfoTech/NHL_Analytics_Hub.git
-cd NHL_Analytics_Hub
-```
-
-### 2. Create and activate a virtual environment
-
-**Windows (PowerShell):**
-```powershell
-python -m venv venv
-venv\Scripts\Activate.ps1
-```
-
-**macOS / Linux:**
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Build the database
+### Build the database
 
 Run the notebooks **in order** — each one depends on tables populated by
 the previous one:
@@ -87,11 +59,7 @@ the previous one:
 
 Open each notebook in VS Code or Jupyter and **Run All**.
 
-### 5. Run the dashboard
-
-```bash
-streamlit run app/app.py
-```
+### Run the dashboard
 
 Then open the URL Streamlit prints (typically `http://localhost:8501`).
 
