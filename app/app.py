@@ -1,30 +1,12 @@
-"""
-NHL Analytics Hub — Streamlit Dashboard
-======================================
-Phase 5 deliverable: a multi-page analytics platform over the SQLite
-database built in notebooks 01-04.
-
-Run with:  streamlit run app.py
-
-Structure of this file
-----------------------
-  1. Config, path resolution and design tokens
-  2. Theme  (single organised CSS block)
-  3. UI primitives  (hero, KPI cards, section headers, cards, tables)
-  4. Chart layer  (shared Plotly theme + graceful fallback)
-  5. Data layer  (SQLite connection, cached query runner)
-  6. SQL query library
-  7. Sidebar (navigation + contextual filter panel)
-  8. Pages: Dashboard / Teams / Players / Games / Insights / SQL Lab
-
-Only the presentation layer was redesigned — every SQL statement, KPI
-calculation and filter behaviour from the original app is preserved.
+"""NHL Analytics Hub - MySQL Streamlit Dashboard.
+Run: streamlit run app.py
 """
 
 import base64
 import html as _html
 import re
-import sqlite3
+import mysql.connector
+from streamlit_option_menu import option_menu
 from pathlib import Path
 
 import pandas as pd
@@ -36,39 +18,17 @@ import streamlit as st
 CURRENT_SEASON_LABEL = "2025–26"
 APP_VERSION = "2.0"
 
-# Anchor every path to this file's own location, not the current working
-# directory. This matters because `streamlit run app.py` behaves
-# differently depending on *where* it's launched from — a relative path
-# like "data/nhl.db" only resolves correctly if you happen to be in the
-# project root. If launched from anywhere else, sqlite3.connect() would
-# NOT raise an error — it silently creates a new, empty database file at
-# the wrong location instead, which looks like "no data" or "not
-# connected" with no obvious error message anywhere.
 BASE_DIR = Path(__file__).resolve().parent
-
-
-def _find_db_path() -> Path:
-    """Look for data/nhl.db next to this script AND one level up.
-
-    Handles two common project layouts:
-      NHL_Analytics_Hub/app.py + NHL_Analytics_Hub/data/nhl.db   (script at root)
-      NHL_Analytics_Hub/app/app.py + NHL_Analytics_Hub/data/nhl.db  (script in app/)
-    Returns the first one that actually exists; if neither exists yet,
-    defaults to the root-sibling path so the error message points
-    somewhere sensible.
-    """
-    candidates = [
-        BASE_DIR / "data" / "nhl.db",
-        BASE_DIR.parent / "data" / "nhl.db",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
-
-
 ASSETS_DIR = BASE_DIR / "assets"
-DB_PATH = _find_db_path()
+
+DB_CONFIG = {
+    "host": "localhost",
+    "port": 3306,
+    "user": "root",
+    "password": "root",
+    "database": "NHL_Analytics_Hub",
+    "connection_timeout": 10,
+}
 
 st.set_page_config(
     page_title="NHL Analytics Hub",
@@ -1050,7 +1010,7 @@ def render_hero(db_ok: bool, teams: int | None = None, games: int | None = None)
             <div class="hero-meta">
                 <div class="hero-pipeline">
                     <span class="pipe-step">NHL API</span><span class="pipe-arrow">→</span>
-                    <span class="pipe-step">SQLite</span><span class="pipe-arrow">→</span>
+                    <span class="pipe-step">MySQL</span><span class="pipe-arrow">→</span>
                     <span class="pipe-step">SQL Analysis</span><span class="pipe-arrow">→</span>
                     <span class="pipe-step">Dashboard</span>
                     {f'<span class="pipe-arrow">·</span><span class="pipe-step">{_esc(scale)}</span>' if scale else ''}
@@ -1091,12 +1051,15 @@ def kpi_card(
 
 
 def render_kpi_row(cards: list[str]) -> None:
-    """Lay KPI cards out in an evenly-spaced, responsive row."""
-    if not cards:
-        return
-    for col, card in zip(st.columns(len(cards)), cards):
-        with col:
-            write(card)
+    columns = st.columns(len(cards))
+    for column, card in zip(columns, cards):
+        def card_text(class_name):
+            match = re.search(r'class="' + class_name + r'[^" ]*[^"<>]*">(.*?)</div>', card, re.S)
+            return _html.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip() if match else ""
+        with column:
+            with st.container(border=True):
+                st.metric(card_text("kpi-label"), card_text("kpi-value"))
+                st.caption(card_text("kpi-sub"))
 
 
 def spotlight_card(eyebrow: str, name: str, meta: str, badge: str = "🏅") -> str:
@@ -1191,8 +1154,8 @@ def render_footer(row_note: str = "") -> None:
         <div class="foot">
             <div>🏒 <b>NHL Analytics Hub</b> v{APP_VERSION} &nbsp;·&nbsp;
                  Season {_esc(CURRENT_SEASON_LABEL)} &nbsp;·&nbsp;
-                 NHL API → SQLite → SQL → Streamlit</div>
-            <div>{_esc(row_note) if row_note else 'All figures queried live from the project database.'}</div>
+                 NHL API → MySQL → SQL → Streamlit</div>
+            <div>{_esc(row_note) if row_note else 'Data cached for up to 5 minutes. Use Refresh data to reload.'}</div>
         </div>
         """
     )
@@ -1219,6 +1182,9 @@ def stat_table(
     if df is None or len(df) == 0:
         empty_state()
         return
+
+    with st.expander("Open data table"):
+        show_df(df)
 
     max_bar = None
     if bar_col and bar_col in df.columns:
@@ -1410,67 +1376,91 @@ def fallback_bar(df: pd.DataFrame, x: str, y: str) -> None:
 
 
 # =========================================================
-# 5. DATA LAYER  (unchanged logic — connection, health check, queries)
+# 5. DATA LAYER  (MySQL connections and season-scoped queries)
 # =========================================================
-@st.cache_resource
 def get_conn():
-    if not DB_PATH.exists():
-        raise FileNotFoundError(
-            f"Database not found at {DB_PATH}. Run notebooks 01-04 first "
-            f"to create and populate data/nhl.db, and make sure this app "
-            f"is run from the project root (or just use `streamlit run "
-            f"app.py` from inside the project folder — the path is now "
-            f"anchored to this file's location either way)."
-        )
-    return sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    # A separate connection per query avoids sharing cursors across users.
+    return mysql.connector.connect(**DB_CONFIG)
+
+
+def validate_select(query):
+    query = query.strip().rstrip(";").strip()
+    if not re.match(r"^SELECT\b", query, re.I):
+        raise ValueError("Enter one SELECT statement.")
+    if ";" in query or re.search(r"--|/\*|#", query):
+        raise ValueError("Use one SELECT statement without SQL comments.")
+    if re.search(r"\b(INTO|OUTFILE|DUMPFILE|SLEEP|BENCHMARK|LOAD_FILE|GET_LOCK|RELEASE_LOCK)\b", query, re.I):
+        raise ValueError("This query uses an unsupported operation.")
+    return query
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _cached_query(query: str, params: tuple) -> tuple:
-    """Cached SELECT execution. Keyed on (query, params) so repeated
-    reads across pages and reruns don't re-hit SQLite."""
+def _cached_query(query: str, params: tuple, season=None) -> tuple:
+    conn = None
     try:
+        query = validate_select(query)
+        if season:
+            # Scope every season-based table, including nested subqueries.
+            tables = ("standings", "games", "skater_season_stats", "goalie_season_stats")
+            used = [table for table in tables if re.search(r"\b" + table + r"\b", query, re.I)]
+            if used:
+                ctes = [f"{table} AS (SELECT * FROM NHL_Analytics_Hub.{table} WHERE season=%s)"
+                        for table in used]
+                query = "WITH " + ", ".join(ctes) + " " + query
+                params = (season,) * len(used) + params
         conn = get_conn()
-        df = pd.read_sql(query, conn, params=params)
+        cursor = conn.cursor()
+        cursor.execute("SET SESSION MAX_EXECUTION_TIME=10000")
+        conn.start_transaction(readonly=True)
+        cursor.execute(query, params)
+        rows = cursor.fetchmany(10001)
+        if len(rows) > 10000:
+            raise ValueError("More than 10,000 rows. Add filters or LIMIT 10000.")
+        df = pd.DataFrame(rows, columns=[col[0] for col in cursor.description])
+        # MySQL returns Decimal for AVG/SUM; convert numeric result columns for charts.
+        from decimal import Decimal
+        for col in df.columns:
+            if any(isinstance(value, Decimal) for value in df[col]):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
         return df, None
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+    except Exception as error:
+        return None, f"{type(error).__name__}: {error}"
+    finally:
+        if conn is not None:
+            conn.rollback()
+            conn.close()
 
 
 def run_query(query: str, params: tuple = ()) -> tuple:
-    """Run a SELECT query safely. Returns (dataframe, error_message)."""
-    return _cached_query(query, tuple(params))
+    season = globals().get("F", {}).get("season")
+    return _cached_query(query, tuple(params), season)
 
 
 def scalar(query: str, params: tuple = (), default=None):
-    """Convenience for single-value queries used by the insight cards."""
     df, err = run_query(query, params)
-    if err or df is None or len(df) == 0 or len(df.columns) == 0:
+    if err or df is None or df.empty or len(df.columns) == 0:
         return default
     value = df.iloc[0, 0]
     return default if pd.isna(value) else value
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def db_health() -> tuple:
-    """Real connection health check — actually queries the database rather
-    than assuming it's fine. Returns (is_connected, status_message)."""
-    if not DB_PATH.exists():
-        return False, "Database file not found"
+    conn = None
     try:
         conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM teams")
-        count = cur.fetchone()[0]
-        if count == 0:
-            return False, "Database empty (0 teams)"
-        return True, f"Connected · {count} teams loaded"
-    except Exception as e:
-        return False, f"Connection error: {type(e).__name__}"
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM teams")
+        count = cursor.fetchone()[0]
+        return True, f"Connected - {count} teams loaded"
+    except Exception as error:
+        return False, str(error)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def db_is_connected() -> tuple:
-    """Kept as the public name used elsewhere in the project."""
     return db_health()
 
 
@@ -1497,6 +1487,8 @@ GAME_STATE_LABELS = {
     "OFF": "Final",
     "FUT": "Upcoming",
     "LIVE": "In Progress",
+    "CRIT": "In Progress",
+    "FINAL": "Final (awaiting official)",
     "PRE": "Pre-Game",
 }
 
@@ -1509,108 +1501,241 @@ FORWARD_CODES = ["C", "L", "R", "LW", "RW"]
 
 
 # =========================================================
-# 6. SQL QUERY LIBRARY  (mirrors sql/queries.sql — unchanged)
+# 6. SQL QUERY LIBRARY  (15 reviewed analysis queries)
 # =========================================================
 QUERY_LIBRARY = {
-    "1. Most total goals this season": """
-        SELECT t.team_name, t.team_abbrev, s.goals_for AS total_goals
-        FROM teams t
-        JOIN standings s ON t.team_id = s.team_id
-        ORDER BY s.goals_for DESC
-        LIMIT 1;
+    '1. Which team has scored the most total goals this season?': """
+SELECT
+    t.team_name,
+    t.team_abbrev,
+    SUM(s.goals_for) AS total_goals
+FROM teams t
+JOIN standings s ON t.team_id = s.team_id
+WHERE 1=1
+GROUP BY t.team_id, t.team_name, t.team_abbrev
+ORDER BY total_goals DESC, t.team_abbrev
+LIMIT 1
     """,
-    "2. Top 5 point scorers league-wide": """
-        SELECT p.first_name, p.last_name, t.team_abbrev,
-               ss.goals, ss.assists, ss.points
-        FROM skater_season_stats ss
-        JOIN players p ON ss.player_id = p.player_id
-        JOIN teams t ON ss.team_id = t.team_id
-        ORDER BY ss.points DESC
-        LIMIT 5;
+    '2. Who are the top 5 point scorers across the entire league?': """
+SELECT
+    p.first_name,
+    p.last_name,
+    t.team_abbrev,
+    ss.goals,
+    ss.assists,
+    ss.points
+FROM skater_season_stats ss
+JOIN players p ON ss.player_id = p.player_id
+JOIN teams t ON ss.team_id = t.team_id
+WHERE 1=1
+ORDER BY ss.points DESC
+LIMIT 5
     """,
-    "3. Players with 20+ goals AND 30+ assists": """
-        SELECT p.first_name, p.last_name, t.team_abbrev,
-               ss.goals, ss.assists, ss.points
-        FROM skater_season_stats ss
-        JOIN players p ON ss.player_id = p.player_id
-        JOIN teams t ON ss.team_id = t.team_id
-        WHERE ss.goals > 20 AND ss.assists > 30
-        ORDER BY ss.points DESC;
+    '3. Which players have scored more than 20 goals AND recorded more than 30 assists?': """
+SELECT
+    p.first_name,
+    p.last_name,
+    t.team_abbrev,
+    ss.goals,
+    ss.assists,
+    ss.points
+FROM skater_season_stats ss
+JOIN players p ON ss.player_id = p.player_id
+JOIN teams t ON ss.team_id = t.team_id
+WHERE 1=1
+  AND ss.goals > 20
+  AND ss.assists > 30
+ORDER BY ss.points DESC
     """,
-    "4. Teams above league-average points": """
-        SELECT t.team_name, t.team_abbrev, s.points
-        FROM teams t
-        JOIN standings s ON t.team_id = s.team_id
-        WHERE s.points > (SELECT AVG(points) FROM standings)
-        ORDER BY s.points DESC;
+    '4. Which teams have a season points total above the league average?': """
+SELECT
+    t.team_name,
+    t.team_abbrev,
+    s.points
+FROM teams t
+JOIN standings s ON t.team_id = s.team_id
+WHERE 1=1
+  AND s.points > (
+    SELECT AVG(points) FROM standings WHERE 1=1
+)
+ORDER BY s.points DESC
     """,
-    "5. Divisions averaging 90+ points": """
-        SELECT t.division_name,
-               ROUND(AVG(s.points), 1) AS avg_division_points,
-               COUNT(*) AS num_teams
-        FROM teams t
-        JOIN standings s ON t.team_id = s.team_id
-        GROUP BY t.division_name
-        HAVING AVG(s.points) > 90
-        ORDER BY avg_division_points DESC;
+    '5. Which divisions have an average team points total above 90?': """
+SELECT
+    t.division_name,
+    ROUND(AVG(s.points), 1) AS avg_division_points,
+    COUNT(*) AS num_teams
+FROM teams t
+JOIN standings s ON t.team_id = s.team_id
+WHERE 1=1
+GROUP BY t.division_name
+HAVING AVG(s.points) > 90
+ORDER BY avg_division_points DESC
     """,
-    "6. Best save % goalies (min 20 GP)": """
-        SELECT p.first_name, p.last_name, t.team_abbrev,
-               gs.games_played, gs.save_pct, gs.goals_against_avg, gs.shutouts
-        FROM goalie_season_stats gs
-        JOIN players p ON gs.player_id = p.player_id
-        JOIN teams t ON gs.team_id = t.team_id
-        WHERE gs.games_played >= 20
-        ORDER BY gs.save_pct DESC
-        LIMIT 10;
+    '6. Which goalies have the best save percentage among those with at least 20 games?': """
+SELECT
+    p.first_name,
+    p.last_name,
+    t.team_abbrev,
+    gs.games_played,
+    gs.save_pct,
+    gs.goals_against_avg,
+    gs.shutouts
+FROM goalie_season_stats gs
+JOIN players p ON gs.player_id = p.player_id
+JOIN teams t ON gs.team_id = t.team_id
+WHERE 1=1
+  AND gs.games_played >= 20
+ORDER BY gs.save_pct DESC
+LIMIT 10
     """,
-    "7. Most wins by team": """
-        SELECT t.team_name, t.conference_name, t.division_name,
-               s.wins, s.losses, s.ot_losses
-        FROM teams t
-        JOIN standings s ON t.team_id = s.team_id
-        ORDER BY s.wins DESC
-        LIMIT 10;
+    '7. Which teams have the most wins this season?': """
+SELECT
+    t.team_name,
+    t.conference_name,
+    t.division_name,
+    s.wins,
+    s.losses,
+    s.ot_losses
+FROM teams t
+JOIN standings s ON t.team_id = s.team_id
+WHERE 1=1
+ORDER BY s.wins DESC
+LIMIT 10
     """,
-    "8. Leading scorer per team": """
-        SELECT team_abbrev, first_name, last_name, goals, assists, points
-        FROM (
-            SELECT t.team_abbrev, p.first_name, p.last_name,
-                   ss.goals, ss.assists, ss.points,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY ss.team_id ORDER BY ss.points DESC
-                   ) AS team_rank
-            FROM skater_season_stats ss
-            JOIN players p ON ss.player_id = p.player_id
-            JOIN teams t ON ss.team_id = t.team_id
-        ) ranked
-        WHERE team_rank = 1
-        ORDER BY points DESC;
+    '8. Who is the leading point scorer on each team?': """
+SELECT
+    team_abbrev,
+    first_name,
+    last_name,
+    goals,
+    assists,
+    points
+FROM (
+    SELECT
+        t.team_abbrev,
+        p.first_name,
+        p.last_name,
+        ss.goals,
+        ss.assists,
+        ss.points,
+        ROW_NUMBER() OVER (
+            PARTITION BY ss.team_id
+            ORDER BY ss.points DESC, ss.goals DESC, ss.player_id
+        ) AS team_rank
+    FROM skater_season_stats ss
+    JOIN players p ON ss.player_id = p.player_id
+    JOIN teams t ON ss.team_id = t.team_id
+    WHERE 1=1
+) ranked
+WHERE team_rank = 1
+ORDER BY points DESC
     """,
-    "9. Best goal differential": """
-        SELECT t.team_name, t.team_abbrev, s.goals_for, s.goals_against,
-               (s.goals_for - s.goals_against) AS goal_differential
-        FROM teams t
-        JOIN standings s ON t.team_id = s.team_id
-        ORDER BY goal_differential DESC
-        LIMIT 10;
+    '9. Which teams have the best goal differential?': """
+SELECT
+    t.team_name,
+    t.team_abbrev,
+    s.goals_for,
+    s.goals_against,
+    (s.goals_for - s.goals_against) AS goal_differential
+FROM teams t
+JOIN standings s ON t.team_id = s.team_id
+WHERE 1=1
+ORDER BY goal_differential DESC
+LIMIT 10
     """,
-    "10. Most penalty minutes vs. points": """
-        SELECT p.first_name, p.last_name, t.team_abbrev,
-               ss.penalty_min, ss.points, ss.games_played
-        FROM skater_season_stats ss
-        JOIN players p ON ss.player_id = p.player_id
-        JOIN teams t ON ss.team_id = t.team_id
-        ORDER BY ss.penalty_min DESC
-        LIMIT 10;
+    '10. Which players have the most penalty minutes, and what is their point production?': """
+SELECT
+    p.first_name,
+    p.last_name,
+    t.team_abbrev,
+    ss.penalty_min,
+    ss.points,
+    ss.games_played
+FROM skater_season_stats ss
+JOIN players p ON ss.player_id = p.player_id
+JOIN teams t ON ss.team_id = t.team_id
+WHERE 1=1
+ORDER BY ss.penalty_min DESC
+LIMIT 10
     """,
-    "11. Home vs. away win gap": """
-        SELECT t.team_name, s.home_wins, s.away_wins,
-               (s.home_wins - s.away_wins) AS home_ice_advantage
-        FROM teams t
-        JOIN standings s ON t.team_id = s.team_id
-        ORDER BY home_ice_advantage DESC
-        LIMIT 10;
+    '11. Which teams have the largest difference between home wins and away wins?': """
+SELECT
+    t.team_name,
+    s.home_wins,
+    s.away_wins,
+    (s.home_wins - s.away_wins) AS home_ice_advantage
+FROM teams t
+JOIN standings s ON t.team_id = s.team_id
+WHERE 1=1
+ORDER BY home_ice_advantage DESC
+LIMIT 10
+    """,
+    '12. Which teams average more than 3 goals across at least 10 completed regular-season games?': """
+SELECT
+    t.team_abbrev,
+    COUNT(*) AS games_played,
+    SUM(r.goals) AS total_goals,
+    ROUND(AVG(r.goals), 2) AS goals_per_game
+FROM (
+    SELECT home_team_id AS team_id, home_score AS goals
+    FROM games WHERE 1=1 AND game_type=2 AND game_state='OFF'
+      AND home_score IS NOT NULL AND away_score IS NOT NULL
+    UNION ALL
+    SELECT away_team_id, away_score
+    FROM games WHERE 1=1 AND game_type=2 AND game_state='OFF'
+      AND home_score IS NOT NULL AND away_score IS NOT NULL
+) r
+JOIN teams t ON t.team_id=r.team_id
+GROUP BY t.team_id, t.team_abbrev
+HAVING COUNT(*) >= 10 AND AVG(r.goals) > 3
+ORDER BY goals_per_game DESC, t.team_abbrev
+    """,
+    '13. Which players have the most three-point regular-season games?': """
+SELECT
+    p.player_id,
+    p.first_name,
+    p.last_name,
+    COUNT(*) AS three_point_games
+FROM game_stats gs
+JOIN players p ON p.player_id=gs.player_id
+JOIN games g ON g.game_id=gs.game_id
+WHERE 1=1 AND g.game_type=2 AND g.game_state='OFF'
+  AND gs.points >= 3
+GROUP BY p.player_id, p.first_name, p.last_name
+ORDER BY three_point_games DESC, p.player_id
+LIMIT 10
+    """,
+    '14. Which teams have the highest shooting percentage in completed regular-season games?': """
+SELECT
+    t.team_abbrev,
+    SUM(gs.goals) AS goals,
+    SUM(gs.shots_on_goal) AS shots,
+    ROUND(100.0 * SUM(gs.goals) / NULLIF(SUM(gs.shots_on_goal), 0), 2) AS shooting_percentage
+FROM game_stats gs
+JOIN teams t ON t.team_id=gs.team_id
+JOIN games g ON g.game_id=gs.game_id
+WHERE 1=1 AND g.game_type=2 AND g.game_state='OFF'
+  AND gs.goals IS NOT NULL AND gs.shots_on_goal IS NOT NULL
+GROUP BY t.team_id, t.team_abbrev
+HAVING SUM(gs.shots_on_goal) > 0
+ORDER BY shooting_percentage DESC, t.team_abbrev
+    """,
+    '15. Which goalies have the most shutouts among those with at least 20 games?': """
+SELECT
+    p.player_id,
+    p.first_name,
+    p.last_name,
+    t.team_abbrev,
+    gs.games_played,
+    gs.shutouts,
+    gs.wins
+FROM goalie_season_stats gs
+JOIN players p ON p.player_id=gs.player_id
+JOIN teams t ON t.team_id=gs.team_id
+WHERE 1=1 AND gs.games_played >= 20
+ORDER BY gs.shutouts DESC, gs.wins DESC, p.player_id
+LIMIT 10
     """,
 }
 
@@ -1650,51 +1775,33 @@ with st.sidebar:
         """
     )
 
-    # ---- Navigation ----
-    if "nav_page" not in st.session_state or st.session_state.nav_page not in NAV_NAMES:
-        st.session_state.nav_page = NAV_NAMES[0]
-
-    write('<div class="sb-label">Navigation</div>')
-    for name, icon, _hint in NAV_PAGES:
-        is_active = st.session_state.nav_page == name
-        if st.button(
-            f"{icon} {name}",
-            key=f"nav_btn_{name}",
-            type="primary" if is_active else "secondary",
-            **_STRETCH,
-        ):
-            st.session_state.nav_page = name
-            st.rerun()
-
-    page = st.session_state.nav_page
+    page = option_menu(
+        "Navigation", NAV_NAMES,
+        icons=["house", "shield", "person", "calendar", "graph-up", "code-slash"],
+        default_index=0, key="nav_page",
+        styles={
+            "container": {"background-color": "#0B1F33"},
+            "nav-link": {"color": "#F5F9FC", "font-size": "14px"},
+            "nav-link-selected": {"background-color": "#145374"},
+        },
+    )
+    if st.button("Refresh data"):
+        st.cache_data.clear()
+        st.rerun()
     _db_ok, _db_status = db_is_connected()
 
     # ---- Contextual filters ----
     if _db_ok:
-        seasons_df, _ = run_query(
-            "SELECT DISTINCT season FROM skater_season_stats "
-            "WHERE season IS NOT NULL ORDER BY season DESC"
+        seasons_df, season_error = _cached_query(
+            "SELECT DISTINCT season FROM standings WHERE season IS NOT NULL ORDER BY season DESC", ()
         )
-        season_values = (
-            seasons_df.season.astype(str).tolist()
-            if seasons_df is not None and len(seasons_df) > 0
-            else []
-        )
-
-        # Only the genuinely global control lives here. Every page-specific
-        # filter (player search, team picker, conference/division, schedule
-        # filters) is rendered in that page's own filter bar, where it is
-        # visible even with the sidebar collapsed.
-        if page in ("Dashboard", "Teams", "Players", "Insights"):
-            write('<div class="sb-label">Global Filter</div>')
-            F["season"] = st.selectbox(
-                "🗓 Season",
-                ["All seasons"] + season_values,
-                index=1 if len(season_values) == 1 else 0,
-                format_func=_season_label,
-                key="flt_season",
-                help="Applies to skater and goalie season statistics on every page.",
-            )
+        season_values = seasons_df.season.astype(str).tolist() if seasons_df is not None else []
+        if season_values:
+            F["season"] = st.selectbox("Season", season_values, format_func=_season_label,
+                                        key="flt_season")
+            CURRENT_SEASON_LABEL = _season_label(F["season"])
+        else:
+            CURRENT_SEASON_LABEL = "No standings season"
 
     # ---- Status panel ----
     write('<div class="sb-label">Data Source</div>')
@@ -1716,7 +1823,7 @@ with st.sidebar:
                 <span style="{_dot}"></span>{_esc(_db_status)}
             </div>
             <div style="margin-top:6px; font-size:10.5px; color:{DIM_GRAY};">
-                SQLite · {_esc(DB_PATH.name)}
+                MySQL · {_esc(DB_CONFIG["database"])}
             </div>
         </div>
         """
@@ -1746,7 +1853,7 @@ def season_clause(alias: str) -> tuple:
     chosen = F.get("season")
     if not chosen or chosen == "All seasons":
         return "", ()
-    return f" AND {alias}.season = ?", (chosen,)
+    return f" AND {alias}.season = %s", (chosen,)
 
 
 # =========================================================
@@ -1757,9 +1864,14 @@ _db_connected, _db_status_msg = db_is_connected()
 if not _db_connected:
     error_state(
         f"Database not connected — {_db_status_msg}",
-        f"Expected the file at <code>{_esc(DB_PATH)}</code>. Run notebooks 01–04 "
-        f"in order to create and populate it, then refresh this page.",
+        "Start MySQL and check DB_CONFIG. Load the MySQL tables using notebooks 01-04.",
     )
+    st.stop()
+
+if not F.get("season"):
+    st.info("Load teams and standings with notebook 01, then refresh data.")
+    st.stop()
+
 
 
 # =========================================================
@@ -1882,7 +1994,7 @@ if page == "Dashboard":
         section_header("📈", "Scoring Race", "Top 10 point producers")
         sc, sp = season_clause("ss")
         top10_df, err = run_query(f"""
-            SELECT p.first_name || ' ' || p.last_name AS player, t.team_abbrev,
+            SELECT CONCAT_WS(' ', p.first_name, p.last_name) AS player, t.team_abbrev,
                    ss.goals, ss.assists, ss.points
             FROM skater_season_stats ss
             JOIN players p ON ss.player_id = p.player_id
@@ -1928,7 +2040,7 @@ if page == "Dashboard":
         if err:
             error_state("Couldn't load team goal data")
         elif scatter_df is None or len(scatter_df) == 0:
-            empty_state("No standings data", "Run notebook 03 to load standings.", "📉")
+            empty_state("No standings data", "Run notebook 01 to load standings.", "📉")
         elif HAS_PLOTLY:
             fig = px.scatter(
                 scatter_df, x="goals_against", y="goals_for",
@@ -1971,7 +2083,7 @@ if page == "Dashboard":
             LIMIT 12
         """)
         if err or pts_df is None or len(pts_df) == 0:
-            empty_state("No standings to chart", "Run notebook 03 to load standings.", "📉")
+            empty_state("No standings to chart", "Run notebook 01 to load standings.", "📉")
         elif HAS_PLOTLY:
             fig = px.bar(
                 pts_df, x="team_abbrev", y="points",
@@ -2172,10 +2284,10 @@ elif page == "Teams":
         """
         params = []
         if conference != "All":
-            query += " AND t.conference_name = ?"
+            query += " AND t.conference_name = %s"
             params.append(conference)
         if division != "All":
-            query += " AND t.division_name = ?"
+            query += " AND t.division_name = %s"
             params.append(division)
         query += " ORDER BY s.points DESC"
 
@@ -2328,7 +2440,7 @@ elif page == "Teams":
                            s.ot_losses, s.points, s.games_played, s.goals_for, s.goals_against
                     FROM teams t
                     JOIN standings s ON t.team_id = s.team_id
-                    WHERE t.team_id = ?
+                    WHERE t.team_id = %s
                 """, (team_id,))
                 write(
                     f"""
@@ -2342,7 +2454,7 @@ elif page == "Teams":
                     dd = detail_df.iloc[0]
                     rank = scalar(
                         "SELECT COUNT(*) + 1 FROM standings WHERE points > "
-                        "(SELECT points FROM standings WHERE team_id = ?)", (team_id,)
+                        "(SELECT points FROM standings WHERE team_id = %s)", (team_id,)
                     )
                     write(
                         f"""
@@ -2357,7 +2469,7 @@ elif page == "Teams":
                     )
                 else:
                     empty_state("No standings row for this team yet",
-                                "Run notebook 03 to load standings.", "🛡️")
+                                "Run notebook 01 to load standings.", "🛡️")
 
             spacer(20)
 
@@ -2388,7 +2500,7 @@ elif page == "Teams":
                     SELECT first_name, last_name, position, jersey_number,
                            shoots_catches, height_cm, weight_kg
                     FROM players
-                    WHERE team_id = ?
+                    WHERE team_id = %s
                     ORDER BY position, last_name
                 """, (team_id,))
                 if err:
@@ -2427,11 +2539,11 @@ elif page == "Teams":
                 section_header("📈", "Scoring Leaders", "Team points leaders")
                 sc, sp = season_clause("ss")
                 team_scorers, err = run_query(f"""
-                    SELECT p.first_name || ' ' || p.last_name AS player,
+                    SELECT CONCAT_WS(' ', p.first_name, p.last_name) AS player,
                            ss.goals, ss.assists, ss.points
                     FROM skater_season_stats ss
                     JOIN players p ON ss.player_id = p.player_id
-                    WHERE ss.team_id = ?{sc}
+                    WHERE ss.team_id = %s{sc}
                     ORDER BY ss.points DESC
                     LIMIT 10
                 """, (team_id,) + sp)
@@ -2529,7 +2641,7 @@ elif page == "Players":
                        p.shoots_catches, t.team_abbrev, t.team_name, t.team_id
                 FROM players p
                 JOIN teams t ON p.team_id = t.team_id
-                WHERE (p.first_name || ' ' || p.last_name) LIKE ?{pos_sql}
+                WHERE (CONCAT_WS(' ', p.first_name, p.last_name)) LIKE %s{pos_sql}
                 ORDER BY p.last_name
             """
             matches_df, err = run_query(query, (f"%{search_term}%",))
@@ -2596,7 +2708,7 @@ elif page == "Players":
                         SELECT season, games_played, wins, losses, ot_losses,
                                save_pct, goals_against_avg, shutouts, saves
                         FROM goalie_season_stats
-                        WHERE player_id = ?{sc}
+                        WHERE player_id = %s{sc}
                         ORDER BY season DESC
                     """, (player_id,) + sp)
                 else:
@@ -2605,7 +2717,7 @@ elif page == "Players":
                         SELECT season, games_played, goals, assists, points,
                                plus_minus, penalty_min, shots, avg_toi
                         FROM skater_season_stats
-                        WHERE player_id = ?{sc}
+                        WHERE player_id = %s{sc}
                         ORDER BY season DESC
                     """, (player_id,) + sp)
 
@@ -2741,7 +2853,7 @@ elif page == "Players":
                 JOIN teams t ON ss.team_id = t.team_id
                 WHERE 1=1{sc}
                 ORDER BY ss.points DESC
-                LIMIT ?
+                LIMIT %s
             """, sp + (top_n,))
             if err:
                 error_state("Leaderboard query failed")
@@ -2771,7 +2883,7 @@ elif page == "Players":
                 JOIN teams t ON ss.team_id = t.team_id
                 WHERE 1=1{sc}
                 ORDER BY ss.goals DESC
-                LIMIT ?
+                LIMIT %s
             """, sp + (top_n,))
             if err:
                 error_state("Leaderboard query failed")
@@ -2800,7 +2912,7 @@ elif page == "Players":
                 JOIN teams t ON ss.team_id = t.team_id
                 WHERE 1=1{sc}
                 ORDER BY ss.penalty_min DESC
-                LIMIT ?
+                LIMIT %s
             """, sp + (top_n,))
             if err:
                 error_state("Leaderboard query failed")
@@ -2846,7 +2958,7 @@ elif page == "Players":
                 JOIN teams t ON gs.team_id = t.team_id
                 WHERE gs.games_played >= 10{gc}
                 ORDER BY gs.save_pct DESC
-                LIMIT ?
+                LIMIT %s
             """, gp_ + (top_n,))
             if err:
                 error_state("Leaderboard query failed")
@@ -2893,7 +3005,7 @@ elif page == "Players":
                 JOIN teams t ON gs.team_id = t.team_id
                 WHERE 1=1{gc}
                 ORDER BY gs.wins DESC
-                LIMIT ?
+                LIMIT %s
             """, gp_ + (top_n,))
             if err:
                 error_state("Leaderboard query failed")
@@ -2934,7 +3046,7 @@ elif page == "Games":
         )
     with g2:
         state_filter = st.radio(
-            "🚦 Game state", ["All", "Final", "Upcoming"],
+            "🚦 Game state", ["All", "Final", "Upcoming", "In Progress"],
             horizontal=True, key="flt_game_state",
         )
     with g3:
@@ -2954,7 +3066,7 @@ elif page == "Games":
     params = []
 
     if team_filter != "All":
-        query += " AND (ht.team_abbrev = ? OR at.team_abbrev = ?)"
+        query += " AND (ht.team_abbrev = %s OR at.team_abbrev = %s)"
         params.extend([team_filter, team_filter])
 
     if state_filter == "Final":
@@ -2962,11 +3074,23 @@ elif page == "Games":
     elif state_filter == "Upcoming":
         query += " AND g.game_state = 'FUT'"
 
+    elif state_filter == "In Progress":
+        query += " AND g.game_state IN ('LIVE', 'CRIT')"
+
     if date_filter:
-        query += " AND g.game_date >= ?"
+        query += " AND g.game_date >= %s"
         params.append(date_filter.strftime("%Y-%m-%d"))
 
-    query += " ORDER BY g.game_date DESC LIMIT ?"
+    conference_df, _ = run_query("SELECT DISTINCT conference_name FROM teams WHERE conference_name IS NOT NULL ORDER BY conference_name")
+    conference_filter = st.selectbox("Conference", ["All"] + (
+        conference_df.conference_name.tolist() if conference_df is not None else []))
+    if conference_filter != "All":
+        query += " AND (ht.conference_name=%s OR at.conference_name=%s)"
+        params.extend([conference_filter, conference_filter])
+
+    game_from_where = query[query.index("FROM games g"):]
+    game_params = tuple(params)
+    query += " ORDER BY g.game_date DESC LIMIT %s"
     params.append(row_limit)
 
     df, err = run_query(query, tuple(params))
@@ -2990,9 +3114,9 @@ elif page == "Games":
             kpi_card("✅", "Completed", _fmt_int(len(played)), "Final results in this selection"),
             kpi_card("⏳", "Upcoming", _fmt_int(int((d["game_state"] == "FUT").sum())),
                      "Scheduled, not yet played"),
-            kpi_card("⚡", "Goals / game", _fmt_float(d["total_goals"].mean(), 2),
+            kpi_card("⚡", "Goals / game", _fmt_float(played["total_goals"].mean(), 2),
                      "Average across completed games in view"),
-            kpi_card("🔥", "Highest scoring", _fmt_int(d["total_goals"].max()),
+            kpi_card("🔥", "Highest scoring", _fmt_int(played["total_goals"].max()),
                      "Most combined goals in one game", accent=True),
         ])
 
@@ -3017,14 +3141,11 @@ elif page == "Games":
         with gcol1:
             section_header("📈", "Games by Month", "Schedule density over the season")
             month_df, m_err = run_query("""
-                SELECT substr(game_date, 1, 7) AS month,
-                       SUM(CASE WHEN game_state = 'OFF' THEN 1 ELSE 0 END) AS completed,
-                       SUM(CASE WHEN game_state = 'FUT' THEN 1 ELSE 0 END) AS upcoming
-                FROM games
-                WHERE game_date IS NOT NULL
-                GROUP BY month
-                ORDER BY month
-            """)
+                SELECT SUBSTR(g.game_date, 1, 7) AS month,
+                       SUM(CASE WHEN g.game_state='OFF' THEN 1 ELSE 0 END) AS completed,
+                       SUM(CASE WHEN g.game_state='FUT' THEN 1 ELSE 0 END) AS upcoming
+            """ + game_from_where + " AND g.game_date IS NOT NULL GROUP BY month ORDER BY month", game_params)
+
             if m_err or month_df is None or len(month_df) == 0:
                 empty_state("No dated games available", "Run notebook 03 to load the schedule.", "📉")
             elif HAS_PLOTLY:
@@ -3055,12 +3176,12 @@ elif page == "Games":
         with gcol2:
             section_header("🔥", "Score Heatmap", "Frequency of final scorelines")
             heat_df, h_err = run_query("""
-                SELECT away_score, home_score, COUNT(*) AS games
-                FROM games
-                WHERE game_state = 'OFF'
-                  AND home_score IS NOT NULL AND away_score IS NOT NULL
-                GROUP BY away_score, home_score
-            """)
+                SELECT g.away_score, g.home_score, COUNT(*) AS games
+            """ + game_from_where + """
+                AND g.game_state='OFF' AND g.home_score IS NOT NULL AND g.away_score IS NOT NULL
+                GROUP BY g.away_score, g.home_score
+            """, game_params)
+
             if h_err or heat_df is None or len(heat_df) == 0:
                 empty_state("No completed games to map", "Final scores are required for this chart.", "📉")
             elif HAS_PLOTLY:
@@ -3180,7 +3301,7 @@ elif page == "Insights":
         ))
 
     eff, _ = run_query("""
-        SELECT p.first_name || ' ' || p.last_name AS player, t.team_abbrev,
+        SELECT CONCAT_WS(' ', p.first_name, p.last_name) AS player, t.team_abbrev,
                ss.points, ss.games_played,
                ROUND(1.0 * ss.points / ss.games_played, 2) AS ppg
         FROM skater_season_stats ss
@@ -3312,7 +3433,7 @@ elif page == "Insights":
 # =========================================================
 elif page == "SQL Lab":
     page_header("💻", "SQL Lab",
-                "Run any of the 11 saved analysis queries, or write your own SELECT")
+                "Run any of the 15 saved analysis queries, or write your own SELECT")
 
     mode = st.radio("Mode", ["Pre-built queries", "Custom query"], horizontal=True)
 
@@ -3346,7 +3467,7 @@ elif page == "SQL Lab":
         if st.button("▶ Run query"):
             df, err = run_query(query_text)
             if err:
-                error_state("Query failed", "The saved query couldn't be executed against this database.")
+                error_state("Query failed", _esc(err))
             elif df is None or len(df) == 0:
                 empty_state("Query ran successfully",
                             "It returned no rows — the filters may exclude everything in this dataset.",
@@ -3355,7 +3476,7 @@ elif page == "SQL Lab":
                 _render_result(df, "query")
 
     else:
-        st.caption("Read-only sandbox — only SELECT statements are permitted.")
+        st.caption("Read-only queries. Results are limited to 10,000 rows.")
         custom_query = st.text_area(
             "Write your SQL query",
             height=170,
@@ -3369,6 +3490,7 @@ elif page == "SQL Lab":
                     <span class="chip ice">standings</span>
                     <span class="chip ice">players</span>
                     <span class="chip ice">games</span>
+                    <span class="chip ice">game_stats</span>
                     <span class="chip ice">skater_season_stats</span>
                     <span class="chip ice">goalie_season_stats</span>
                 </div>
@@ -3385,7 +3507,7 @@ elif page == "SQL Lab":
                 df, err = run_query(stripped)
                 if err:
                     error_state("Query failed",
-                                "Check table and column names — the available tables are listed above.")
+                                _esc(err))
                 elif df is None or len(df) == 0:
                     empty_state("Query ran successfully", "It returned no rows.", "📄")
                 else:
