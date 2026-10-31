@@ -1,0 +1,9 @@
+streamlit>=1.49,<2
+streamlit-option-menu>=0.4,<1
+pandas>=2.2,<3
+mysql-connector-python>=9,<10
+requests>=2.32,<3
+urllib3>=2,<3
+plotly>=6,<7
+ipython>=8
+jupyterlab>=4,<5
