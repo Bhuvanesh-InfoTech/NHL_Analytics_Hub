@@ -1,4 +1,4 @@
-# NHL Analytics Hub
+# 🏒 NHL Analytics Hub
 
 An NHL data pipeline with MySQL analysis and an interactive Streamlit dashboard.
 
