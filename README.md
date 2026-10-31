@@ -1,99 +1,129 @@
-# 🏒 NHL Analytics Hub
+# NHL Analytics Hub
 
-An end-to-end data pipeline and analytics dashboard built on the official
-NHL public API — REST API ingestion → normalized SQL database → SQL
-analysis → interactive Streamlit dashboard.
+An NHL data pipeline with MySQL analysis and an interactive Streamlit dashboard.
 
 ## Overview
 
-This project fetches live data from the NHL API across teams, players,
-games, and player statistics, parses and normalizes it into a 7-table
-relational schema, answers business questions with SQL, and presents the
-results through a multi-page Streamlit dashboard.
+The project collects data from the NHL public API, converts JSON responses into
+seven relational tables, and displays team, player, game and season statistics.
 
 ## Tech Stack
 
 | Layer | Tool |
 |---|---|
 | Language | Python 3 |
-| Data fetching | `requests` |
-| Data wrangling | `pandas` |
-| Database | **SQLite** (via Python's built-in `sqlite3` module — no server setup required) |
-| Dashboard | `streamlit` + `streamlit-option-menu` |
-| Notebooks | Jupyter (`.ipynb`) for the ETL pipeline |
+| API requests | requests |
+| Data processing | pandas |
+| Database | MySQL 8.0+ |
+| Database connector | mysql-connector-python |
+| Dashboard | Streamlit and streamlit-option-menu |
+| Charts | Plotly |
+| Data collection | Jupyter notebooks |
 
+## Project Structure
 
-## Database Schema
+```text
+NHL_Analytics_Hub/
+├── app/
+│   └── app.py
+├── notebooks/
+│   ├── 01_fetch_teams_standings_SQLServer.ipynb
+│   ├── 02_fetch_players_MySQL.ipynb
+│   ├── 03_fetch_games_MySQL.ipynb
+│   └── 04_fetch_stats_MySQL.ipynb
+├── sql/
+│   └── queries.sql
+├── .gitignore
+├── README.md
+└── requirements.txt
+```
 
-7 normalized tables:
+The first notebook retains `SQLServer` in its filename, but its code uses MySQL.
 
-| Table | Source Endpoint | Description |
+## Database Tables
+
+| Table | API source | Data |
 |---|---|---|
-| `teams` | `standings/now` | Team identity, conference, division |
-| `standings` | `standings/now` | Season win/loss/points record per team |
-| `players` | `roster/{team}/current` | Player bio and physical info |
-| `games` | `club-schedule-season/{team}/{season}` | Full season schedule and scores |
-| `game_stats` | `gamecenter/{game_id}/boxscore` | Per-game skater stats |
-| `skater_season_stats` | `player/{player_id}/landing` | Season totals for skaters |
-| `goalie_season_stats` | `player/{player_id}/landing` | Season totals for goalies |
+| teams | standings/now | Team names, abbreviations, conferences and divisions |
+| standings | standings/now | Team season records and points |
+| players | roster/{team}/current | Player details and current team |
+| games | club-schedule-season/{team}/{season} | Schedules, scores and game states |
+| game_stats | gamecenter/{game_id}/boxscore | Skater statistics for individual games |
+| skater_season_stats | player/{player_id}/landing | Skater season totals |
+| goalie_season_stats | player/{player_id}/landing | Goalie season statistics |
 
-Full column definitions and constraints are in [`sql/create_tables.sql`](sql/create_tables.sql).
+The notebooks contain the MySQL table creation statements. A separate
+`create_tables.sql` file is not required for the current notebook setup.
 
+## Setup
 
-### Build the database
+### 1. Install dependencies
 
-Run the notebooks **in order** — each one depends on tables populated by
-the previous one:
+Run from the project folder:
 
-1. `notebooks/01_fetch_teams_standings.ipynb` — creates the database and
-   loads `teams` + `standings`
-2. `notebooks/02_fetch_players.ipynb` — loads `players`
-3. `notebooks/03_fetch_games.ipynb` — loads `games`. Pinned to a completed
-   season (`SEASON = "20252026"`) rather than `"now"`, since during the
-   NHL off-season `"now"` resolves to the upcoming season with no played
-   games yet.
-4. `notebooks/04_fetch_stats.ipynb` — loads `game_stats`,
-   `skater_season_stats`, and `goalie_season_stats`. Progress is
-   checkpointed with a database commit every 25 records, so it's safe to
-   re-run if interrupted.
+```text
+python -m pip install streamlit streamlit-option-menu pandas requests mysql-connector-python plotly jupyterlab
+```
 
-Open each notebook in VS Code or Jupyter and **Run All**.
+### 2. Configure MySQL
 
-### Run the dashboard
+Start MySQL and check the connection settings in each notebook and `DB_CONFIG`
+in `app/app.py`. Use your own host, port, username, password and database name.
+Do not publish database passwords to GitHub.
 
-Then open the URL Streamlit prints (typically `http://localhost:8501`).
+The first notebook creates the configured database and the teams and standings
+tables. The remaining notebooks create their respective tables before loading data.
+
+### 3. Run the notebooks
+
+Open Jupyter or VS Code and run the notebooks in this order:
+
+1. `notebooks/01_fetch_teams_standings_SQLServer.ipynb` — teams and standings.
+2. `notebooks/02_fetch_players_MySQL.ipynb` — player details and rosters.
+3. `notebooks/03_fetch_games_MySQL.ipynb` — schedules and game results.
+4. `notebooks/04_fetch_stats_MySQL.ipynb` — game, skater and goalie statistics.
+
+Use compatible season settings across data collection, SQL analysis and the dashboard.
+
+### 4. Run the dashboard
+
+```text
+streamlit run app/app.py
+```
+
+Open the local URL displayed in the terminal, usually `http://localhost:8501`.
 
 ## SQL Analysis
 
-11 documented queries covering aggregation, JOINs, subqueries, GROUP BY +
-HAVING, multi-condition WHERE clauses, and a window function — see
-[`sql/queries.sql`](sql/queries.sql). The same queries are also available
-interactively from the dashboard's **SQL Query** page.
+`sql/queries.sql` contains **15 queries: 5 given questions and 10 original questions**.
+The queries cover JOINs, aggregation, subqueries, GROUP BY, HAVING, ORDER BY,
+multiple WHERE conditions and window functions.
+
+Set the script's season variable to a season loaded in MySQL before running it.
+The saved queries are also available in the dashboard's SQL Lab.
 
 ## Dashboard Pages
 
-| Page | What it shows |
+| Page | Features |
 |---|---|
-| Home | League-wide KPIs, top scorer/goalie highlights, top-5 scorers chart |
-| Standings | Full standings, filterable by conference/division |
-| Team Info | Team detail + roster grouped by position |
-| Player Search | Search any player, see stat cards and a headshot |
-| Game Results | Browse games, filterable by team/date/game state |
-| Leaderboards | Top scorers, most penalty minutes, best save %, most wins |
-| SQL Query | Run any of the 11 pre-built queries, or write your own `SELECT` |
+| Dashboard | Season overview, KPI cards and highlights |
+| Teams | Standings, conference and division filters, team profiles and rosters |
+| Players | Name search, player details and leaderboards |
+| Games | Schedule and results with conference, team, date and game-state filters |
+| Insights | Team comparisons and calculated observations |
+| SQL Lab | Saved analysis queries and a custom SELECT query editor |
 
-## Known Limitations
+Dynamic filters add conditions to SQL queries before results are retrieved.
 
-- `players.team_id` reflects each player's **current** roster, while
-  `games`/`game_stats`/season stats target the most recently completed
-  season by default — a player traded over the summer may show a
-  mismatched team.
-- The NHL's `roster/{team}/current` endpoint is known to intermittently
-  omit active players from its response (a documented upstream API
-  quirk), so player counts can vary slightly between runs.
+## Data Notes
+
+- Current rosters may differ from historical game participants or past team assignments.
+- Season statistics depend on the season returned or selected during data collection.
+- Upcoming games may have no scores, and some API fields may be missing.
+- Strict leaderboard thresholds can return no rows early in a season.
+- Team-based statistics depend on the team attribution stored in the database.
 
 ## Author
 
-Built as a data engineering / analytics portfolio project covering REST
-API integration, JSON parsing, relational database design, SQL analysis,
-and dashboard development.
+Built as a data engineering and analytics portfolio project covering REST APIs,
+JSON processing, relational database design, SQL analysis and dashboard development.
